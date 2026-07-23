@@ -58,6 +58,42 @@ start-lakom:
 		--cache-ttl=$(CACHE_TTL) \
 		--cache-refresh-interval=$(CACHE_REFRESH_INTERVAL)
 
+.PHONY: debug-extension-seed
+debug-extension-seed:
+	@LEADER_ELECTION_NAMESPACE=$(LEADER_ELECTION_NAMESPACE) dlv debug ./cmd/$(EXTENSION_FULL_NAME) -- \
+		--ignore-operation-annotation=$(IGNORE_OPERATION_ANNOTATION) \
+		--leader-election=$(LEADER_ELECTION) \
+		--leader-election-id=extension-shoot-lakom-service-leader-election \
+		--config=./example/00-config.yaml \
+		--extension-classes=seed
+
+.PHONY: debug-extension-seed-headless
+debug-extension-seed-headless:
+	@LEADER_ELECTION_NAMESPACE=$(LEADER_ELECTION_NAMESPACE) dlv debug --headless --listen=:2345 --api-version=2 --accept-multiclient ./cmd/$(EXTENSION_FULL_NAME) -- \
+		--ignore-operation-annotation=$(IGNORE_OPERATION_ANNOTATION) \
+		--leader-election=$(LEADER_ELECTION) \
+		--leader-election-id=extension-shoot-lakom-service-leader-election \
+		--config=./example/00-config.yaml \
+		--extension-classes=seed
+
+.PHONY: debug-extension-garden
+debug-extension-garden:
+	@LEADER_ELECTION_NAMESPACE=$(LEADER_ELECTION_NAMESPACE) dlv debug ./cmd/$(EXTENSION_FULL_NAME) -- \
+		--ignore-operation-annotation=$(IGNORE_OPERATION_ANNOTATION) \
+		--leader-election=$(LEADER_ELECTION) \
+		--leader-election-id=extension-shoot-lakom-service-leader-election \
+		--config=./example/00-config.yaml \
+		--extension-classes=garden
+
+.PHONY: debug-extension-garden-headless
+debug-extension-garden-headless:
+	@LEADER_ELECTION_NAMESPACE=$(LEADER_ELECTION_NAMESPACE) dlv debug --headless --listen=:2345 --api-version=2 --accept-multiclient ./cmd/$(EXTENSION_FULL_NAME) -- \
+		--ignore-operation-annotation=$(IGNORE_OPERATION_ANNOTATION) \
+		--leader-election=$(LEADER_ELECTION) \
+		--leader-election-id=extension-shoot-lakom-service-leader-election \
+		--config=./example/00-config.yaml \
+		--extension-classes=garden
+
 .PHONE: dev-setup
 dev-setup: $(COSIGN)
 	@$(HACK_DIR)/generate-certificates.sh

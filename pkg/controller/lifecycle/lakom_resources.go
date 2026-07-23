@@ -39,53 +39,28 @@ import (
 )
 
 var (
-	shootWebhookRules []admissionregistrationv1.RuleWithOperations = []admissionregistrationv1.RuleWithOperations{{
-		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
-		Rule: admissionregistrationv1.Rule{
-			APIGroups:   []string{""},
-			APIVersions: []string{"v1"},
-			Resources:   []string{"pods", "pods/ephemeralcontainers"},
-		},
-	}}
+	operations = []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update}
 
-	gardenRuntimeWebhookRules []admissionregistrationv1.RuleWithOperations = []admissionregistrationv1.RuleWithOperations{
-		{
-			Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
-			Rule: admissionregistrationv1.Rule{
-				APIGroups:   []string{""},
-				APIVersions: []string{"v1"},
-				Resources:   []string{"pods", "pods/ephemeralcontainers"},
-			},
-		},
-		{
-			Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
-			Rule: admissionregistrationv1.Rule{
-				APIGroups:   []string{"operator.gardener.cloud"},
-				APIVersions: []string{"v1alpha1"},
-				Resources:   []string{"extensions"},
-			},
-		},
-	}
+	podsRule                  = admissionregistrationv1.Rule{APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: []string{"pods", "pods/ephemeralcontainers"}}
+	extensionsRule            = admissionregistrationv1.Rule{APIGroups: []string{"operator.gardener.cloud"}, APIVersions: []string{"v1alpha1"}, Resources: []string{"extensions"}}
+	controllerDeploymentsRule = admissionregistrationv1.Rule{APIGroups: []string{"core.gardener.cloud"}, APIVersions: []string{"v1"}, Resources: []string{"controllerdeployments"}}
+	gardenletsRule            = admissionregistrationv1.Rule{APIGroups: []string{"seedmanagement.gardener.cloud"}, APIVersions: []string{"v1alpha1"}, Resources: []string{"gardenlets"}}
 
-	gardenVirtualWebhookRules []admissionregistrationv1.RuleWithOperations = []admissionregistrationv1.RuleWithOperations{
-		{
-			Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
-			Rule: admissionregistrationv1.Rule{
-				APIGroups:   []string{"core.gardener.cloud"},
-				APIVersions: []string{"v1"},
-				Resources:   []string{"controllerdeployments"},
-			},
-		},
-		{
-			Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
-			Rule: admissionregistrationv1.Rule{
-				APIGroups:   []string{"seedmanagement.gardener.cloud"},
-				APIVersions: []string{"v1alpha1"},
-				Resources:   []string{"gardenlets"},
-			},
-		},
-	}
+	shootWebhookRules         = addForCreateUpdate(podsRule)
+	gardenRuntimeWebhookRules = addForCreateUpdate(podsRule, extensionsRule)
+	gardenVirtualWebhookRules = addForCreateUpdate(controllerDeploymentsRule, gardenletsRule)
 )
+
+func addForCreateUpdate(rules ...admissionregistrationv1.Rule) []admissionregistrationv1.RuleWithOperations {
+	res := make([]admissionregistrationv1.RuleWithOperations, 0, len(rules))
+	for _, rule := range rules {
+		res = append(res, admissionregistrationv1.RuleWithOperations{
+			Operations: operations,
+			Rule:       rule,
+		})
+	}
+	return res
+}
 
 func getWebhookResources(
 	webhookOptions webhookOptions,
