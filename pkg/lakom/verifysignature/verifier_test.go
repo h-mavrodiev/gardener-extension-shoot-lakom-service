@@ -100,6 +100,7 @@ var _ = Describe("Verifier", func() {
 			Entry("Fail to parse bad image tag", ptr.To("gardener/non-existing-image:123!"), false, true, "could not parse reference"),
 			Entry("Refuse to verify image not using digest", ptr.To("registry.k8s.io/pause:3.7"), false, true, "artifact reference is not a digest, reference: \"registry.k8s.io/pause:3.7\""),
 			Entry("Successfully verify signed image", &signedImageFullRef, true, false, ""),
+			Entry("Successfully verify image signed with the new bundle format", &newBundleSignedImageFullRef, true, false, ""),
 			Entry("Fail signature check when image exists but it has not been signed", &unsignedImageFullRef, false, false, ""),
 		)
 
@@ -153,6 +154,7 @@ var _ = Describe("Verifier", func() {
 			Entry("Fail to parse bad image tag", ptr.To("gardener/non-existing-image:123!"), false, true, "could not parse reference"),
 			Entry("Refuse to verify image not using digest", ptr.To("registry.k8s.io/pause:3.7"), false, true, "artifact reference is not a digest, reference: \"registry.k8s.io/pause:3.7\""),
 			Entry("Successfully verify signed image", &signedImageFullRef, true, false, ""),
+			Entry("Successfully verify image signed with the new bundle format", &newBundleSignedImageFullRef, true, false, ""),
 			Entry("Fail signature check when image exists but it has not been signed", &unsignedImageFullRef, false, false, ""),
 		)
 
@@ -197,6 +199,20 @@ var _ = Describe("Verifier", func() {
 
 		Expect(verifysignature.IsNoSignaturesFound(noSignaturesFound)).To(BeTrue())
 		Expect(verifysignature.IsNoSignaturesFound(fmt.Errorf("some other error"))).To(BeFalse())
+	})
+
+	It("Should detect NoMatchingAttestations error", func() {
+		noMatchingAttestations := &cosign.ErrNoMatchingAttestations{}
+
+		Expect(verifysignature.IsNoMatchingAttestations(noMatchingAttestations)).To(BeTrue())
+		Expect(verifysignature.IsNoMatchingAttestations(fmt.Errorf("some other error"))).To(BeFalse())
+	})
+
+	It("Should detect ImageTagNotFound error", func() {
+		imageTagNotFound := &cosign.ErrImageTagNotFound{}
+
+		Expect(verifysignature.IsImageTagNotFound(imageTagNotFound)).To(BeTrue())
+		Expect(verifysignature.IsImageTagNotFound(fmt.Errorf("some other error"))).To(BeFalse())
 	})
 
 })

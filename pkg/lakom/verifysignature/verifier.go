@@ -7,6 +7,7 @@ package verifysignature
 import (
 	"context"
 	"crypto/rsa"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -15,10 +16,12 @@ import (
 	"github.com/gardener/gardener-extension-shoot-lakom-service/pkg/lakom/metrics"
 	"github.com/gardener/gardener-extension-shoot-lakom-service/pkg/lakom/utils"
 
+	"github.com/go-logr/logr"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
 	ociremote "github.com/sigstore/cosign/v3/pkg/oci/remote"
+	sgverify "github.com/sigstore/sigstore-go/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/options"
 	"golang.org/x/sync/singleflight"
@@ -65,11 +68,17 @@ func (r *directVerifier) Verify(ctx context.Context, artifact string, kcr utils.
 }
 
 func verify(ctx context.Context, artifactRef name.Reference, keys lakomconfig.CompletedConfig, opts ...ociremote.Option) (bool, error) {
-	if _, ok := artifactRef.(name.Digest); !ok {
+	digestRef, ok := artifactRef.(name.Digest)
+	if !ok {
 		return false, fmt.Errorf("artifact reference is not a digest, reference: %q", artifactRef.Name())
 	}
 
 	logger := logf.FromContext(ctx).WithValues("image", artifactRef.Name())
+
+	// signatureFound tracks whether any signature (new-bundle or legacy format) is attached to the
+	// artifact at all, so that an unsigned artifact can be distinguished from one whose signatures
+	// do not match any of the configured public keys.
+	signatureFound := false
 
 	// We need successful verification for at least one key, therefore any other failures can be ignored.
 	for _, k := range keys.Keys {
@@ -95,47 +104,125 @@ func verify(ctx context.Context, artifactRef name.Reference, keys lakomconfig.Co
 			continue
 		}
 
-		checkedSignatures, _, err := cosign.VerifyImageSignatures(ctx, artifactRef, &cosign.CheckOpts{
-			RegistryClientOpts: opts,
-			SigVerifier:        verifier,
-			ClaimVerifier:      cosign.SimpleClaimVerifier,
-			IgnoreSCT:          true,
-			IgnoreTlog:         true,
-		})
+		// Verify the image signature against the current public key. The new cosign v3 bundle
+		// format (OCI 1.1 referrer) is checked first, falling back to the legacy ".sig" tag format.
+		verified, found, err := verifyNewBundle(ctx, digestRef, verifier, log, opts...)
 		if err != nil {
-			if IsNoSignaturesFound(err) {
-				log.Info("No signatures found for the artifact", "error", err.Error())
-				return false, nil
-			}
-
-			if IsNoMatchingSignatures(err) {
-				if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-					// Mitigation for https://github.com/gardener/gardener-extension-shoot-lakom-service/issues/25
-					// TODO(vpnachev): remove when https://github.com/sigstore/cosign/issues/3133 is fixed and vendored
-					log.Info("No matching signatures error detected as canceled or deadline exceeded context", "error", err)
-					return false, err
-				}
-
-				log.Info("No matching signatures found for current public key", "error", err.Error())
-				continue
-			}
-
 			return false, err
 		}
-
-		if len(checkedSignatures) == 0 {
-			// the cosign library is returning an error if the checkedSignatures are 0
-			// but this can changed in a future version and break us
-			log.Info("Found no valid signatures")
-			continue
+		signatureFound = signatureFound || found
+		if verified {
+			log.Info("Image signature successfully verified", "format", "new-bundle")
+			return true, nil
 		}
 
-		log.Info("Image signature successfully verified")
-		return true, nil
+		verified, found, err = verifyLegacySignature(ctx, digestRef, verifier, log, opts...)
+		if err != nil {
+			return false, err
+		}
+		signatureFound = signatureFound || found
+		if verified {
+			log.Info("Image signature successfully verified", "format", "legacy")
+			return true, nil
+		}
+	}
+
+	if !signatureFound {
+		logger.Info("No signatures found for the artifact")
+		return false, nil
 	}
 
 	logger.Info("Image signature verification failed for all configured keys")
 	return false, nil
+}
+
+// verifyLegacySignature verifies the legacy cosign signature (attached as a ".sig" tag) of the
+// artifact against the provided verifier. The returned 'found' indicates whether any legacy
+// signature is attached to the artifact at all, so that the caller can distinguish an unsigned
+// artifact from a signature that does not match the current key.
+func verifyLegacySignature(ctx context.Context, artifactRef name.Digest, verifier signature.Verifier, log logr.Logger, opts ...ociremote.Option) (verified bool, found bool, err error) {
+	checkedSignatures, _, err := cosign.VerifyImageSignatures(ctx, artifactRef, &cosign.CheckOpts{
+		RegistryClientOpts: opts,
+		SigVerifier:        verifier,
+		ClaimVerifier:      cosign.SimpleClaimVerifier,
+		IgnoreSCT:          true,
+		IgnoreTlog:         true,
+	})
+	if err != nil {
+		if IsNoSignaturesFound(err) {
+			return false, false, nil
+		}
+
+		if IsNoMatchingSignatures(err) {
+			if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				// Mitigation for https://github.com/gardener/gardener-extension-shoot-lakom-service/issues/25
+				// TODO(vpnachev): remove when https://github.com/sigstore/cosign/issues/3133 is fixed and vendored
+				log.Info("No matching signatures error detected as canceled or deadline exceeded context", "error", err)
+				return false, true, err
+			}
+
+			log.Info("No matching legacy signatures found for current public key", "error", err.Error())
+			return false, true, nil
+		}
+
+		return false, true, err
+	}
+
+	if len(checkedSignatures) == 0 {
+		// the cosign library is returning an error if the checkedSignatures are 0
+		// but this can changed in a future version and break us
+		log.Info("Found no valid legacy signatures")
+		return false, true, nil
+	}
+
+	return true, true, nil
+}
+
+// verifyNewBundle verifies the cosign v3 new bundle format signatures (attached as OCI 1.1
+// referrers) of the artifact against the provided verifier. It returns verified=true as soon
+// as one attached bundle is successfully verified. The returned 'found' indicates whether any
+// new-bundle signature is attached to the artifact at all, so that the caller can distinguish an
+// artifact without a new-bundle signature (fall back to the legacy format) from a new-bundle
+// signature that does not match the current key (try the next key).
+func verifyNewBundle(ctx context.Context, artifactRef name.Digest, verifier signature.Verifier, log logr.Logger, opts ...ociremote.Option) (verified bool, found bool, err error) {
+	bundles, hash, err := cosign.GetBundles(ctx, artifactRef, opts)
+	if err != nil {
+		// Both errors indicate that no new bundle format signature is attached to the artifact,
+		// which is not a verification failure - the caller falls back to the legacy format.
+		if IsNoMatchingAttestations(err) || IsImageTagNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+
+	digestBytes, err := hex.DecodeString(hash.Hex)
+	if err != nil {
+		return false, true, err
+	}
+	artifactPolicyOption := sgverify.WithArtifactDigest(hash.Algorithm, digestBytes)
+
+	checkOpts := &cosign.CheckOpts{
+		SigVerifier:     verifier,
+		ClaimVerifier:   cosign.SimpleClaimVerifier,
+		IgnoreSCT:       true,
+		IgnoreTlog:      true,
+		NewBundleFormat: true,
+	}
+
+	for _, bundle := range bundles {
+		if _, err := cosign.VerifyNewBundle(ctx, checkOpts, artifactPolicyOption, bundle); err != nil {
+			if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return false, true, err
+			}
+
+			log.Info("New bundle signature did not verify for current public key", "error", err.Error())
+			continue
+		}
+
+		return true, true, nil
+	}
+
+	return false, true, nil
 }
 
 type cacheVerifier struct {
@@ -193,5 +280,21 @@ func IsNoMatchingSignatures(err error) bool {
 // [cosign.ErrNoSignaturesFound].
 func IsNoSignaturesFound(err error) bool {
 	var t *cosign.ErrNoSignaturesFound
+	return errors.As(err, &t)
+}
+
+// IsNoMatchingAttestations checks if error is of type
+// [cosign.ErrNoMatchingAttestations]. It is returned by [cosign.GetBundles]
+// when no new bundle format signatures are attached to the artifact.
+func IsNoMatchingAttestations(err error) bool {
+	var t *cosign.ErrNoMatchingAttestations
+	return errors.As(err, &t)
+}
+
+// IsImageTagNotFound checks if error is of type
+// [cosign.ErrImageTagNotFound]. It is returned by [cosign.GetBundles]
+// when the artifact tag cannot be resolved in the registry.
+func IsImageTagNotFound(err error) bool {
+	var t *cosign.ErrImageTagNotFound
 	return errors.As(err, &t)
 }

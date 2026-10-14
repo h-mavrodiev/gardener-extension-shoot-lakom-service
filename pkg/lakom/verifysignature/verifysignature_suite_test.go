@@ -5,12 +5,15 @@
 package verifysignature_test
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"log"
@@ -25,21 +28,30 @@ import (
 	registryv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	ggcrstatic "github.com/google/go-containerregistry/pkg/v1/static"
+	ggcrtypes "github.com/google/go-containerregistry/pkg/v1/types"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	"github.com/sigstore/cosign/v3/pkg/oci/mutate"
 	ociRemote "github.com/sigstore/cosign/v3/pkg/oci/remote"
 	"github.com/sigstore/cosign/v3/pkg/oci/signed"
 	"github.com/sigstore/cosign/v3/pkg/oci/static"
+	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
+	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
+	sgbundle "github.com/sigstore/sigstore-go/pkg/bundle"
 	"github.com/sigstore/sigstore/pkg/signature"
+	"github.com/sigstore/sigstore/pkg/signature/options"
+	"google.golang.org/protobuf/encoding/protojson"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 var (
 	// FullRef use the digest instead of the tag.
-	signedImageFullRef   string
-	unsignedImageFullRef string
+	signedImageFullRef          string
+	newBundleSignedImageFullRef string
+	unsignedImageFullRef        string
 
 	// TagRef use the tag instead of the digest for referencing the artifact.
 	signedImageTagRef      string
@@ -54,8 +66,9 @@ var (
 )
 
 const (
-	signedImageTag   = "signed"
-	unsignedImageTag = "unsigned"
+	signedImageTag          = "signed"
+	newBundleSignedImageTag = "newbundlesigned"
+	unsignedImageTag        = "unsigned"
 )
 
 func TestVerifySignatureSuite(t *testing.T) {
@@ -83,10 +96,13 @@ var _ = BeforeSuite(func() {
 
 	signedImage, signedImageRef, err := createTestImage(registryURL, signedImageTag)
 	Expect(err).ToNot(HaveOccurred())
+	newBundleSignedImage, newBundleSignedImageRef, err := createTestImage(registryURL, newBundleSignedImageTag)
+	Expect(err).ToNot(HaveOccurred())
 	_, unsignedImageRef, err := createTestImage(registryURL, unsignedImageTag)
 	Expect(err).ToNot(HaveOccurred())
 
 	signedImageFullRef = signedImageRef.Name()
+	newBundleSignedImageFullRef = newBundleSignedImageRef.Name()
 	unsignedImageFullRef = unsignedImageRef.Name()
 
 	signedImageTagRef = signedImageRef.Context().Tag(signedImageTag).String()
@@ -100,6 +116,7 @@ var _ = BeforeSuite(func() {
 	Expect(err).ToNot(HaveOccurred())
 
 	Expect(signImage(signedImage, signedImageFullRef, privateKey)).ToNot(HaveOccurred())
+	Expect(signImageNewBundleFormat(newBundleSignedImage, newBundleSignedImageFullRef, privateKey)).ToNot(HaveOccurred())
 })
 
 func startRegistry() (*url.URL, *httptest.Server) {
@@ -193,4 +210,73 @@ func signImage(image registryv1.Image, imageFullRef string, privateKey *ecdsa.Pr
 	}
 
 	return ociRemote.WriteSignatures(digest.Context(), si)
+}
+
+// signImageNewBundleFormat signs the image using the cosign v3 new bundle format (Cosign Bundle
+// Spec) and attaches it to the image as an OCI 1.1 referrer, mirroring what `cosign sign
+// --new-bundle-format` produces for a static public key (no Fulcio certificate, no Rekor entry,
+// no TSA timestamp). The message signature is computed over the raw image digest bytes, which is
+// what the verifier checks via verify.WithArtifactDigest.
+func signImageNewBundleFormat(_ registryv1.Image, imageFullRef string, privateKey *ecdsa.PrivateKey) error {
+	digest, err := name.NewDigest(imageFullRef)
+	if err != nil {
+		return err
+	}
+
+	// The sha256 of the image manifest - this is the artifact digest the signature is bound to.
+	hash, err := registryv1.NewHash(digest.DigestStr())
+	if err != nil {
+		return err
+	}
+	digestBytes, err := hex.DecodeString(hash.Hex)
+	if err != nil {
+		return err
+	}
+
+	signerVerifier, err := signature.LoadSignerVerifier(privateKey, crypto.SHA256)
+	if err != nil {
+		return err
+	}
+
+	// Sign the pre-hashed image digest. This matches sigstore-go's message-signature verification,
+	// which calls VerifySignature(sig, <empty>, options.WithDigest(artifactDigest)).
+	sig, err := signerVerifier.SignMessage(bytes.NewReader([]byte{}), options.WithDigest(digestBytes))
+	if err != nil {
+		return err
+	}
+
+	// Build the public key hint (base64(sha256(PKIX(pubKey)))) exactly as cosign does.
+	pkixPubKey, err := x509.MarshalPKIXPublicKey(privateKey.Public())
+	if err != nil {
+		return err
+	}
+	hashedBytes := sha256.Sum256(pkixPubKey)
+	hint := base64.StdEncoding.EncodeToString(hashedBytes[:])
+
+	bundle, err := cbundle.MakeProtobufBundle(hint, nil, nil, nil)
+	if err != nil {
+		return err
+	}
+	bundle.Content = &protobundle.Bundle_MessageSignature{
+		MessageSignature: &protocommon.MessageSignature{
+			MessageDigest: &protocommon.HashOutput{
+				Algorithm: protocommon.HashAlgorithm_SHA2_256,
+				Digest:    digestBytes,
+			},
+			Signature: sig,
+		},
+	}
+
+	bundleBytes, err := protojson.Marshal(bundle)
+	if err != nil {
+		return err
+	}
+
+	bundleMediaType, err := sgbundle.MediaTypeString("0.3")
+	if err != nil {
+		return err
+	}
+	layer := ggcrstatic.NewLayer(bundleBytes, ggcrtypes.MediaType(bundleMediaType))
+
+	return ociRemote.WriteReferrer(digest, bundleMediaType, []registryv1.Layer{layer}, nil)
 }
